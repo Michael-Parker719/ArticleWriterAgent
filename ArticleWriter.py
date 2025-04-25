@@ -13,37 +13,48 @@ newsapi = NewsApiClient(api_key=NEWSAPI_KEY)
 
 ## Fetch trending topics using NewsAPI
 ## This function fetches the top 3 trending news articles and formats them for the agent.
-@function_tool  
+@function_tool
 async def fetch_trending_topics(topic: str):
-    print(f"🔍 Fetching news for: {topic}")
+    print(f"Fetching news for: {topic}")
     try:
-        headlines = newsapi.get_top_headlines(q=topic, language='en', page_size=3)
+        page_size = 6
+        headlines = newsapi.get_top_headlines(q=topic, language='en', page_size=page_size)
         print("API Status:", headlines.get('status'))
         print("Total Results:", headlines.get('totalResults', 'N/A'))
-        articles = headlines.get('articles', [])
+        articles = headlines.get('articles', []) or []
 
-        if len(articles) < 3:
-            print("🔁 Trying fallback get_everything...")
-            headlines = newsapi.get_everything(q=topic, language='en', page_size=5, sort_by='relevancy')
-            print("API Status:", headlines.get('status'))
-            print("Total Results:", headlines.get('totalResults', 'N/A'))
-            articles = headlines.get('articles', [])
+        if len(articles) < page_size:
+            print("Not enough articles found, trying get_everything...")
+            more = newsapi.get_everything(q=topic, language='en', page_size=page_size, sort_by='relevancy')
+            print("Fallback Status:", more.get('status'))
+            print("Fallback Total:", more.get('totalResults', 'N/A'))
+
+            extra = more.get('articles', []) or []
+            urls = {a['url'] for a in articles if a.get('url')}
+            for art in extra:
+                if art.get('url') not in urls:
+                    articles.append(art)
+                    urls.add(art['url'])
+                if len(articles) > page_size:
+                    break
+
 
         if not articles:
-            return "🚫 No articles found for this topic. Try a broader or different topic."
+            return "No articles found for this topic. Try a broader or different topic."
 
         formatted = []
-        for article in articles:
-            title = article.get('title', '[No Title]')
-            description = article.get('description', '[No Description]')
-            url = article.get('url', '[No URL]')
-            formatted.append(f"Title: {title}\nDescription: {description}\nURL: {url}")
-
+        i = 0
+        for art in articles[:page_size]:
+            title = art.get('title', '[No Title]')
+            description = art.get('description', '[No Description]')
+            url = art.get('url', '[No URL]')
+            formatted.append(f"{i+1}) Title: {title}\nDescription: {description}\nURL: {url}")
+            i+=1
         result = "\n\n".join(formatted)
         return result
 
     except Exception as e:
-        return f"❌ Error fetching news: {str(e)}"
+        return f"Error fetching news: {str(e)}"
 
 
 
@@ -52,7 +63,10 @@ async def fetch_trending_topics(topic: str):
 ## This agent fetches trending topics and formats them for the writer agent.
 news_scout_agent = Agent(
     name="news_scout_agent",
-    instructions="You are a news scout. Provide 3 relevant, recent trending news topics including their titles, short descriptions, and URLs.",
+    instructions="You are a news scout. Provide **up to 5** relevant, recent trending news topics including their titles, short descriptions, and URLs."
+    "This will be returned to you in the format: {i}) Title: {title}\nDescription: {description}\nURL: {url}"
+    "It is very important to include the Title, description, and URL in the same format you recieve it, as this will be used to find sources later."
+    "If no articles are found, return 'No articles found for this topic. Try a broader or different topic.'",
     tools=[fetch_trending_topics]
 )
 
@@ -60,7 +74,10 @@ news_scout_agent = Agent(
 ## This agent generates a news article and headline based on the given topic.
 writer_agent = Agent(
     name="writer_agent",
-    instructions="You are a professional news writer. Based on the given topic, generate a headline and a complete article (100-150 words). Your writing should be clear, engaging, and factual. Avoid bias or unsupported claims.",
+    instructions="You are a professional news writer. Based on the given topic, generate a headline and a complete article (100-150 words)." 
+    "Your writing should be clear, engaging, and factual. Avoid bias or unsupported claims."
+    "Include a headline, article body, and a list of sources in markdown format. "
+    "If you can't find any sources, return 'No sources found.'"
 )
 
 ## Manager Agent
@@ -75,27 +92,26 @@ manager_agent = Agent(
         - News Scout Agent: Fetches trending topics or news headlines.
         - Writer Agent: Writes a news article and headline about a given topic.
 
-        Your job is to:
-        1. Use the user-provided topic to ask the News Scout Agent for trending news in that category.
-        2. After fetching trending topics, present 3 of them to the user labeled with numbers and ask which one they would like to write about. Wait for their response before continuing.
-        3. Ask the Writer Agent to write an article about the chosen result.
-        4. Ask the user if they are satisified with the article. If not, ask them what they would like to change and update the article accordingly.
-        5. If the user is satisfied, end the conversation and provide the final article.
-
-        Be sure to log all steps for transparency. Prioritize journalistic integrity, clarity, and user relevance.
+        You are the manager agent of Daily Danny. Your job is:
+        1. Take the user’s topic and find headlines from recent news. → call news_scout_tool(topic).
+        2. Present at most 5 headlines to the user. If 5 headlines are available, present 5 → ask “Which one?”
+        3. On choice → call writer_tool with the chosen headline to draft the article. Be sure to inclue the headline, description, and URL in the prompt to the writer agent.
+        4. Present the article to the user
+        6) Ask the user if they’re satisfied or want edits.
         """,
     tools=[
         news_scout_agent.as_tool(
             tool_name="news_scout_tool",
-            tool_description="Use this tool to find trending news topics from external sources (RSS, NewsAPI, Bing News).",
+            tool_description="Use this tool to fetch trending news headlines and topics. Pass a topic to get relevant articles.",
         ),
         writer_agent.as_tool(
             tool_name="writer_tool",
             tool_description="Use this tool to write a news article and headline based on the given topic.",
         ),
-        # image_finder_agent,
-        # dalle_agent,
-        # database_agent,
+        # research_agent (use OpenAI WebSearchTool),
+        # image_finder_agent (use OpenAI WebSearchTool),
+        # dalle_agent (Use Dalle to make a cover image),
+        # database_agent (Upload the article to an SQL database),
     ],
 )
 
@@ -118,6 +134,7 @@ def extract_all_text(run_result):
 async def main():
     prompt = input("Enter a topic you would like to write an article about:\n> ")
     print("Starting Article Writer...")
+
     result = await Runner.run(manager_agent, prompt)
 
     while True:
